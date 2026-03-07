@@ -1,4 +1,4 @@
-# Context Engineering Framework
+# CtxForge
 
 A context engineering toolkit for solo developers shipping production software with AI on local hardware (single RTX 3090).
 

@@ -112,6 +112,21 @@ def _parse_flags(args: list[str]) -> tuple[list[str], dict]:
     return positional, flags
 
 
+def _resolve_path(raw: str) -> Optional[Path]:
+    """
+    Resolve a path string that may contain ~ or be relative.
+
+    Returns None and prints a helpful error if the path can't be expanded,
+    e.g. if the user typed '~Documents/...' instead of '~/Documents/...'.
+    """
+    try:
+        return Path(raw).expanduser().resolve()
+    except RuntimeError as e:
+        _print_err(f"Error resolving path '{raw}': {e}")
+        _print_err("  Hint: use ~/path/to/dir (with a slash after ~) or an absolute path.")
+        return None
+
+
 # ---------------------------------------------------------------------------
 # New compact commands (full / dump / map / tokens)
 # ---------------------------------------------------------------------------
@@ -136,9 +151,12 @@ def cmd_full(args: list[str], config: dict) -> None:
 
     positional, flags = _parse_flags(args)
 
-    code_path = Path(positional[0]).expanduser().resolve() if positional else None
-    if code_path is None or not code_path.exists():
-        _print_err(f"Error: code path '{positional[0] if positional else ''}' not found")
+    code_path = _resolve_path(positional[0]) if positional else None
+    if code_path is None:
+        return
+    if not code_path.exists():
+        _print_err(f"Error: '{positional[0]}' not found (resolved to {code_path})")
+        _print_err("  Hint: use ~/path/... or an absolute path starting with /")
         return
 
     migrations_dir = None
@@ -191,15 +209,18 @@ def cmd_dump(args: list[str], config: dict) -> None:
         _print_err("Usage: dump <code_path> [migrations_path]")
         return
 
-    code_path = Path(args[0]).expanduser().resolve()
+    code_path = _resolve_path(args[0])
+    if code_path is None:
+        return
     if not code_path.exists():
-        _print_err(f"Error: {code_path} not found")
+        _print_err(f"Error: '{args[0]}' not found (resolved to {code_path})")
+        _print_err("  Hint: use ~/path/... or an absolute path starting with /")
         return
 
     migrations_dir = None
     if len(args) >= 2:
-        maybe = Path(args[1]).expanduser().resolve()
-        if maybe.is_dir():
+        maybe = _resolve_path(args[1])
+        if maybe is not None and maybe.is_dir():
             migrations_dir = maybe
 
     from src.compactor import compact_full, CompactOptions

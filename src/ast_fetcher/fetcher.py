@@ -93,6 +93,11 @@ def _extract_function(
         first_line = docstring.strip().split("\n")[0]
         parts.append(f'    """{first_line}"""')
 
+    # Compact body hint (extracted before the body is discarded)
+    hint = _extract_body_hint(node)
+    if hint:
+        parts.append(f"    # → {hint}")
+
     parts.append("    ...")
 
     return "\n".join(parts)
@@ -155,6 +160,10 @@ def _extract_class(node: ast.ClassDef, lines: list[str]) -> str:
             if method_docstring:
                 first_line = method_docstring.strip().split("\n")[0]
                 method_parts.append(f'        """{first_line}"""')
+
+            method_hint = _extract_body_hint(item)
+            if method_hint:
+                method_parts.append(f"        # → {method_hint}")
 
             method_parts.append("        ...")
             parts.append("\n".join(method_parts))
@@ -236,6 +245,104 @@ def _unparse_node(node: ast.AST) -> str:
         return ast.unparse(node)
     except Exception:
         return "..."
+
+
+def _call_name(call: ast.Call) -> Optional[str]:
+    """Extract a short readable name from a Call node."""
+    if isinstance(call.func, ast.Name):
+        return call.func.id
+    if isinstance(call.func, ast.Attribute):
+        return call.func.attr
+    return None
+
+
+def _extract_body_hint(
+    node: ast.FunctionDef | ast.AsyncFunctionDef,
+) -> Optional[str]:
+    """
+    Extract a compact action chain from a function body before it is stripped.
+
+    Walks the AST body looking for constructor calls, method calls, loops, and
+    comprehensions. Returns a short "→"-joined chain (max 60 chars) that gives
+    the LLM a behavioural hint without preserving any real implementation.
+
+    Returns None for trivial bodies (pass, return literal, single expression).
+    """
+    body = node.body
+    start = 0
+    # Skip module/function docstring
+    if (
+        body
+        and isinstance(body[0], ast.Expr)
+        and isinstance(body[0].value, ast.Constant)
+        and isinstance(body[0].value.value, str)
+    ):
+        start = 1
+
+    # Trivial: nothing left after the docstring
+    if len(body) - start <= 1 and all(
+        isinstance(s, (ast.Pass, ast.Return, ast.Expr)) for s in body[start:]
+    ):
+        return None
+
+    _SKIP_NAMES = frozenset(
+        {"None", "True", "False", "self", "cls", "super", "len", "str", "int",
+         "list", "dict", "set", "tuple", "print", "range", "enumerate",
+         "zip", "map", "filter", "sorted", "reversed", "type", "isinstance"}
+    )
+
+    actions: list[str] = []
+
+    for stmt in body[start:]:
+        hint: Optional[str] = None
+
+        if isinstance(stmt, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
+            val = (
+                stmt.value
+                if isinstance(stmt, ast.Assign)
+                else (stmt.value if isinstance(stmt, ast.AnnAssign) else stmt.value)
+            )
+            if isinstance(val, ast.Call):
+                hint = _call_name(val)
+            elif isinstance(val, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                hint = "iter"
+
+        elif isinstance(stmt, ast.Expr):
+            if isinstance(stmt.value, ast.Call):
+                hint = _call_name(stmt.value)
+            elif isinstance(stmt.value, (ast.ListComp, ast.SetComp, ast.GeneratorExp)):
+                hint = "iter"
+
+        elif isinstance(stmt, ast.Return):
+            if stmt.value is None:
+                pass
+            elif isinstance(stmt.value, ast.Call):
+                hint = _call_name(stmt.value)
+            elif isinstance(stmt.value, (ast.ListComp, ast.SetComp, ast.DictComp, ast.GeneratorExp)):
+                hint = "iter"
+
+        elif isinstance(stmt, ast.For):
+            hint = "iter"
+
+        elif isinstance(stmt, ast.Raise):
+            hint = "raise"
+
+        elif isinstance(stmt, ast.With):
+            hint = "ctx"
+
+        if hint and hint not in _SKIP_NAMES and hint not in actions:
+            actions.append(hint)
+
+        if len(actions) >= 4:
+            break
+
+    if not actions:
+        return None
+
+    chain = " → ".join(actions)
+    if len(chain) > 60:
+        chain = chain[:57] + "..."
+    return chain
 
 
 def extract_from_file(filepath: Path) -> str:

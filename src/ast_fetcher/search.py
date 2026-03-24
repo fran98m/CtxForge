@@ -344,14 +344,15 @@ def search_files(
     top_k: int = 20,
     include_tests: bool = True,
     exclude_patterns: Optional[list[str]] = None,
-    import_boost: float = 0.3,
+    boost_down: float = 0.2,
+    boost_up: float = 0.4,
 ) -> list[tuple[str, float]]:
     """
     Search a directory for Python files relevant to a natural language query.
 
     Returns a sorted list of (relative_path, score) tuples, highest first.
-    Only files with score > 0 are returned. Import graph propagation gives
-    a boost to files that are imported by high-scoring files.
+    Only files with score > 0 are returned. Bidirectional import graph
+    propagation boosts both dependencies AND consumers of high-scoring files.
 
     Args:
         directory: Root directory to search.
@@ -359,7 +360,12 @@ def search_files(
         top_k: Maximum number of files to return.
         include_tests: Whether to include test files.
         exclude_patterns: Directory names to skip.
-        import_boost: Fraction of a file's score propagated to its imports.
+        boost_down: Fraction of a file's score propagated to its imports
+                    (consumer → dependency). Default 0.2.
+        boost_up:   Fraction of an import's score propagated to its consumers
+                    (dependency → consumer). Default 0.4 — intentionally higher
+                    because a highly-relevant dependency means callers probably
+                    need context too.
     """
     exclude = set(exclude_patterns or [])
     exclude.update({"__pycache__", ".git", "node_modules", ".venv", "venv", "spikes"})
@@ -391,27 +397,31 @@ def search_files(
         if score > 0:
             file_scores[rel] = score
 
-    # Phase 2: Import graph propagation
-    # If quiz.py scores high and imports from utils/scoring.py,
-    # scoring.py gets a relevance boost even if it didn't match keywords directly.
-    if import_boost > 0 and file_scores:
+    # Phase 2: Bidirectional import graph propagation
+    # boost_down: high-scoring file pushes score to its imports (dependencies likely relevant)
+    # boost_up:   high-scoring import pushes score back to consumers (callers likely relevant)
+    if (boost_down > 0 or boost_up > 0) and file_scores:
         import_graph = extract_import_graph(directory, exclude)
 
-        # Propagate: for each high-scoring file, boost what it imports
-        propagated: dict[str, float] = defaultdict(float)
-        for filepath, score in file_scores.items():
-            if filepath in import_graph:
-                for imported_file in import_graph[filepath]:
-                    propagated[imported_file] += score * import_boost
+        # Build reverse graph: imported_file → set of files that import it
+        consumers: dict[str, set[str]] = defaultdict(set)
+        for importer, imported_set in import_graph.items():
+            for imported in imported_set:
+                consumers[imported].add(importer)
 
-        # Also reverse propagation: if a file is imported BY a relevant file,
-        # that's a signal. But we already handle that above.
-        # Add: if a file imports a relevant file, it gets a smaller boost
-        for filepath in file_sources:
-            if filepath in import_graph:
-                for imported_file in import_graph[filepath]:
-                    if imported_file in file_scores:
-                        propagated[filepath] += file_scores[imported_file] * (import_boost * 0.5)
+        propagated: dict[str, float] = defaultdict(float)
+
+        # boost_down: consumer scores flow to its dependencies
+        if boost_down > 0:
+            for filepath, score in file_scores.items():
+                for imported_file in import_graph.get(filepath, set()):
+                    propagated[imported_file] += score * boost_down
+
+        # boost_up: dependency scores flow to their consumers
+        if boost_up > 0:
+            for filepath, score in file_scores.items():
+                for consumer_file in consumers.get(filepath, set()):
+                    propagated[consumer_file] += score * boost_up
 
         for filepath, boost in propagated.items():
             if filepath in file_sources:  # Only boost files we actually found

@@ -224,3 +224,90 @@ def test_module_docstring():
 
     result = extract_signatures(source)
     assert "This module handles authentication" in result
+
+
+# ---------------------------------------------------------------------------
+# Body hint tests
+# ---------------------------------------------------------------------------
+
+from src.ast_fetcher.fetcher import _extract_body_hint
+import ast
+
+
+# TEST: Body hint captures constructor calls and method chains
+def test_body_hint_call_chain():
+    source = textwrap.dedent('''
+        def process_order(order_id: str):
+            order = Order(order_id)
+            order.validate()
+            result = save_result(order)
+            return result
+    ''').strip()
+    tree = ast.parse(source)
+    func = tree.body[0]
+    hint = _extract_body_hint(func)
+    assert hint is not None
+    assert "Order" in hint
+    assert "validate" in hint or "save_result" in hint
+
+
+# TEST: Body hint detects for-loop iteration
+def test_body_hint_iteration():
+    source = textwrap.dedent('''
+        def process_items(items: list) -> list:
+            result = []
+            for item in items:
+                result.append(item.process())
+            return result
+    ''').strip()
+    tree = ast.parse(source)
+    func = tree.body[0]
+    hint = _extract_body_hint(func)
+    assert hint is not None
+    assert "iter" in hint
+
+
+# TEST: Body hint returns None for trivial functions (pass or single return literal)
+def test_body_hint_trivial_returns_none():
+    source = textwrap.dedent('''
+        def noop():
+            pass
+    ''').strip()
+    tree = ast.parse(source)
+    func = tree.body[0]
+    hint = _extract_body_hint(func)
+    assert hint is None
+
+
+# TEST: Body hint is included in extract_signatures output as # → comment
+def test_body_hint_in_extraction_output():
+    source = textwrap.dedent('''
+        def process(data: dict) -> dict:
+            """Process some data."""
+            result = transform(data)
+            save(result)
+            return result
+    ''').strip()
+    result = extract_signatures(source)
+    # Body must be stripped
+    assert "transform(data)" not in result
+    assert "save(result)" not in result
+    # But a hint comment should appear
+    assert "# \u2192" in result
+    assert "transform" in result or "save" in result
+
+
+# TEST: Body hint length is capped at 60 characters
+def test_body_hint_max_length():
+    source = textwrap.dedent('''
+        def complex_function():
+            create_something_very_long()
+            process_another_very_long_thing()
+            finalize_and_save_everything_here()
+            return cleanup_and_finalize()
+    ''').strip()
+    tree = ast.parse(source)
+    func = tree.body[0]
+    hint = _extract_body_hint(func)
+    assert hint is not None
+    assert len(hint) <= 60

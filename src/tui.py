@@ -5,16 +5,29 @@ No curses, no blessed, no rich — just clean stdin/stdout interaction.
 This is CLI tooling for a solo developer, not a dashboard.
 
 Commands:
-    context <path> [--query "..."]   — Extract codebase context
-    scrape <url> [url2 ...]         — Scrape documentation via Jina
-    curate <url>                    — Scrape + LLM categorize + store
-    heal                            — Check and re-scrape stale docs
-    search <query>                  — Search stored documentation
-    stats                           — Show database statistics
-    health                          — Check llama-server status
-    pipeline <url> [url2 ...]       — Full pipeline: scrape → curate → store
-    help                            — Show commands
-    quit                            — Exit
+    full <code> [migrations] <query> [flags]  — Code + schema YAML bundle
+    dump <code> [migrations]                  — Full dump (no search)
+    map  <code>                               — Domain entity map
+    tokens <file> [--budget N]               — Token analysis of a file
+    context <path> [--query "..."]           — Extract codebase context (plain text)
+    scrape <url> [url2 ...]                  — Scrape documentation via Jina
+    curate <url>                             — Scrape + LLM categorize + store
+    heal                                     — Check and re-scrape stale docs
+    search <query>                           — Search stored documentation
+    stats                                    — Show database statistics
+    health                                   — Check llama-server status
+    pipeline <url> [url2 ...]               — Full pipeline: scrape → curate → store
+    help                                     — Show commands
+    quit                                     — Exit
+
+Flags for full/dump:
+    --topk N          Max code files to include (default 5)
+    --topk-tables N   Max schema tables (default 10)
+    --tables t1,t2    Explicit table list
+    --budget N        Token budget for report
+    --all             Full dump (code + schema)
+    --all-schema      Full schema, search code
+    --all-code        Full code, search schema
 
 Unix philosophy: status to stderr, output to stdout.
 """
@@ -35,6 +48,266 @@ def _print_err(msg: str) -> None:
 def _print_out(msg: str) -> None:
     """Print to stdout for data output."""
     print(msg)
+
+
+# ---------------------------------------------------------------------------
+# Output path helpers
+# ---------------------------------------------------------------------------
+
+def _ensure_results_dir() -> Path:
+    """Create and return the results/ directory relative to cwd."""
+    results = Path("results")
+    results.mkdir(exist_ok=True)
+    return results
+
+
+def _build_output_path(prefix: str, ext: str, query: str = "") -> Path:
+    """
+    Build a timestamped output path under results/.
+
+    Example: results/context_bundle_order_cancel_20260324_103045.yml
+    """
+    from datetime import datetime
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = ""
+    if query:
+        # Derive slug from query: lowercase, replace spaces with _, max 24 chars
+        import re
+        slug = "_" + re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")[:24]
+    return _ensure_results_dir() / f"{prefix}{slug}_{ts}.{ext}"
+
+
+def _parse_flags(args: list[str]) -> tuple[list[str], dict]:
+    """
+    Split a flat args list into positional args and flag values.
+
+    Supported flags:
+        --topk N, --topk-tables N, --tables t1,t2,
+        --budget N, --all, --all-schema, --all-code
+    """
+    positional: list[str] = []
+    flags: dict = {}
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--topk" and i + 1 < len(args):
+            flags["top_k"] = int(args[i + 1]); i += 2
+        elif a == "--topk-tables" and i + 1 < len(args):
+            flags["top_k_tables"] = int(args[i + 1]); i += 2
+        elif a == "--tables" and i + 1 < len(args):
+            flags["explicit_tables"] = [t.strip() for t in args[i + 1].split(",")]; i += 2
+        elif a == "--budget" and i + 1 < len(args):
+            flags["budget"] = int(args[i + 1]); i += 2
+        elif a == "--all":
+            flags["all_code"] = True; flags["all_schema"] = True; i += 1
+        elif a == "--all-schema":
+            flags["all_schema"] = True; i += 1
+        elif a == "--all-code":
+            flags["all_code"] = True; i += 1
+        elif a.startswith("--"):
+            _print_err(f"Unknown flag: {a}")
+            i += 1
+        else:
+            positional.append(a); i += 1
+    return positional, flags
+
+
+# ---------------------------------------------------------------------------
+# New compact commands (full / dump / map / tokens)
+# ---------------------------------------------------------------------------
+
+def cmd_full(args: list[str], config: dict) -> None:
+    """
+    Produce a YAML context bundle: code signatures + optional schema.
+
+    Usage:
+        full <code_path> [migrations_path] <query> [flags]
+        full <code_path> [migrations_path] --all
+
+    The second positional argument is treated as a migrations directory if it
+    is an existing directory; otherwise it is the start of the query string.
+    """
+    if not args:
+        _print_err(
+            "Usage: full <code_path> [migrations_path] <query> [flags]\n"
+            "       full <code_path> --all"
+        )
+        return
+
+    positional, flags = _parse_flags(args)
+
+    code_path = Path(positional[0]).expanduser().resolve() if positional else None
+    if code_path is None or not code_path.exists():
+        _print_err(f"Error: code path '{positional[0] if positional else ''}' not found")
+        return
+
+    migrations_dir = None
+    query_parts_start = 1
+    if len(positional) >= 2:
+        maybe_migrations = Path(positional[1]).expanduser().resolve()
+        if maybe_migrations.is_dir():
+            migrations_dir = maybe_migrations
+            query_parts_start = 2
+
+    query = " ".join(positional[query_parts_start:]).strip()
+
+    from src.compactor import compact_full, CompactOptions
+
+    opts = CompactOptions(
+        code_path=code_path,
+        query=query,
+        top_k=flags.get("top_k", 5),
+        all_code=flags.get("all_code", False),
+        migrations_dir=migrations_dir,
+        all_schema=flags.get("all_schema", False),
+        top_k_tables=flags.get("top_k_tables", 10),
+        explicit_tables=flags.get("explicit_tables"),
+        budget=flags.get("budget"),
+    )
+
+    _print_err("Building context bundle...")
+    result = compact_full(opts)
+
+    out_path = _build_output_path("context_bundle", "yml", query)
+    out_path.write_text(result.content, encoding="utf-8")
+    _print_err(f"Written: {out_path}")
+
+    if result.token_report:
+        r = result.token_report
+        _print_err(f"Tokens: {r.total:,}")
+        if r.budget:
+            _print_err(f"Budget: {r.budget['utilization_pct']}% of {r.budget['limit']:,}")
+
+    _print_out(result.content)
+
+
+def cmd_dump(args: list[str], config: dict) -> None:
+    """
+    Full dump — code + schema with no search filter.
+
+    Usage: dump <code_path> [migrations_path]
+    """
+    if not args:
+        _print_err("Usage: dump <code_path> [migrations_path]")
+        return
+
+    code_path = Path(args[0]).expanduser().resolve()
+    if not code_path.exists():
+        _print_err(f"Error: {code_path} not found")
+        return
+
+    migrations_dir = None
+    if len(args) >= 2:
+        maybe = Path(args[1]).expanduser().resolve()
+        if maybe.is_dir():
+            migrations_dir = maybe
+
+    from src.compactor import compact_full, CompactOptions
+
+    opts = CompactOptions(
+        code_path=code_path,
+        query="",
+        all_code=True,
+        migrations_dir=migrations_dir,
+        all_schema=True,
+    )
+
+    _print_err("Dumping full context...")
+    result = compact_full(opts)
+
+    out_path = _build_output_path("context_bundle_dump", "yml")
+    out_path.write_text(result.content, encoding="utf-8")
+    _print_err(f"Written: {out_path}")
+
+    if result.token_report:
+        _print_err(f"Tokens: {result.token_report.total:,}")
+
+    _print_out(result.content)
+
+
+def cmd_map(args: list[str], config: dict) -> None:
+    """
+    Domain entity map — list all classes and standalone functions per file.
+
+    Usage: map <code_path>
+    """
+    if not args:
+        _print_err("Usage: map <code_path>")
+        return
+
+    import ast as _ast
+
+    code_path = Path(args[0]).expanduser().resolve()
+    if not code_path.exists():
+        _print_err(f"Error: {code_path} not found")
+        return
+
+    _SKIP = {"__pycache__", ".git", ".venv", "venv", "node_modules"}
+    lines: list[str] = ["# Domain Entity Map", f"# Source: {code_path}", ""]
+
+    for py_file in sorted(code_path.rglob("*.py")):
+        if any(part in _SKIP for part in py_file.parts):
+            continue
+        try:
+            source = py_file.read_text(encoding="utf-8")
+            tree = _ast.parse(source)
+        except (SyntaxError, OSError, UnicodeDecodeError):
+            continue
+
+        entities: list[str] = []
+        for node in _ast.iter_child_nodes(tree):
+            if isinstance(node, _ast.ClassDef):
+                methods = [
+                    item.name
+                    for item in node.body
+                    if isinstance(item, (_ast.FunctionDef, _ast.AsyncFunctionDef))
+                ]
+                method_str = f"  [{', '.join(methods[:6])}{'...' if len(methods) > 6 else ''}]" if methods else ""
+                entities.append(f"  class {node.name}{method_str}")
+            elif isinstance(node, (_ast.FunctionDef, _ast.AsyncFunctionDef)):
+                entities.append(f"  def {node.name}()")
+
+        if entities:
+            rel = str(py_file.relative_to(code_path))
+            lines.append(f"{rel}:")
+            lines.extend(entities)
+            lines.append("")
+
+    content = "\n".join(lines)
+    out_path = _build_output_path("domain_map", "txt")
+    out_path.write_text(content, encoding="utf-8")
+    _print_err(f"Written: {out_path}")
+    _print_out(content)
+
+
+def cmd_tokens(args: list[str], config: dict) -> None:
+    """
+    Analyse token usage of a context bundle file.
+
+    Usage: tokens <file> [--budget N]
+    """
+    if not args:
+        _print_err("Usage: tokens <file> [--budget N]")
+        return
+
+    positional, flags = _parse_flags(args)
+    if not positional:
+        _print_err("Usage: tokens <file> [--budget N]")
+        return
+
+    file_path = Path(positional[0]).expanduser().resolve()
+    if not file_path.exists():
+        _print_err(f"Error: {file_path} not found")
+        return
+
+    content = file_path.read_text(encoding="utf-8")
+
+    from src.tokens import analyze_tokens, granular_breakdown, format_token_report
+
+    budget = flags.get("budget")
+    report = analyze_tokens(content, budget_limit=budget)
+    granular = granular_breakdown(content)
+    _print_out(format_token_report(report, granular))
 
 
 # ---------------------------------------------------------------------------
@@ -314,8 +587,23 @@ def cmd_help(args: list[str], config: dict) -> None:
     _print_out("""
 Context Framework — Terminal Interface
 
-Commands:
-  context <path> [--query "..."]   Extract codebase context (search → compress)
+Context bundle commands (YAML output, token-efficient):
+  full <code> [migrations] <query> [flags]   Code + schema YAML bundle
+  dump <code> [migrations]                   Full dump, no search filter
+  map  <code>                                Domain entity map per file
+  tokens <file> [--budget N]                Token analysis of any file
+
+Flags for full/dump:
+  --topk N          Max code files (default 5)
+  --topk-tables N   Max schema tables (default 10)
+  --tables t1,t2    Explicit table list
+  --budget N        Token budget for utilisation report
+  --all             Full dump (code + schema)
+  --all-schema      Full schema, search code
+  --all-code        Full code, search schema
+
+Doc curator commands:
+  context <path> [--query "..."]   Extract codebase context (plain text)
   scrape <url> [url2 ...]         Scrape docs via Jina Reader
   curate <url>                    Scrape + LLM categorize + store in DB
   pipeline <url> [url2 ...]       Full pipeline for multiple URLs
@@ -340,6 +628,10 @@ def cmd_clear(args: list[str], config: dict) -> None:
 # ---------------------------------------------------------------------------
 
 COMMANDS = {
+    "full": cmd_full,
+    "dump": cmd_dump,
+    "map": cmd_map,
+    "tokens": cmd_tokens,
     "context": cmd_context,
     "scrape": cmd_scrape,
     "curate": cmd_curate,

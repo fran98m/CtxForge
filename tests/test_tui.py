@@ -58,9 +58,14 @@ def test_dispatch_bare_url_suggests_curate(capsys):
     assert "https://example.com/docs" in captured.err
 
 
-# TEST: All expected commands are registered in COMMANDS dict
+# TEST: All expected commands (old and new) are registered in COMMANDS dict
 def test_all_commands_registered():
-    expected = {"context", "scrape", "curate", "pipeline", "search", "heal", "stats", "health", "clear", "help"}
+    expected = {
+        "context", "scrape", "curate", "pipeline", "search", "heal",
+        "stats", "health", "clear", "help",
+        # New compact commands added in v0.2
+        "full", "dump", "map", "tokens",
+    }
     assert expected == set(COMMANDS.keys())
 
 

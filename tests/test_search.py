@@ -286,8 +286,8 @@ def test_search_files_no_matches(tmp_path):
     assert results == []
 
 
-# TEST: Import boost propagates relevance to dependency files
-def test_search_files_import_boost(tmp_path):
+# TEST: boost_down propagates relevance from consumer to its dependency files
+def test_search_files_boost_down(tmp_path):
     (tmp_path / "quiz.py").write_text(textwrap.dedent('''
         from scoring import calculate_score
 
@@ -302,16 +302,85 @@ def test_search_files_import_boost(tmp_path):
             pass
     '''))
 
-    # Without query mentioning "scoring" directly via filename,
-    # scoring.py should still get a boost because quiz.py imports it
-    results = search_files(tmp_path, "quiz generation", import_boost=0.5)
+    # scoring.py should get a boost because quiz.py (high score) imports it
+    results = search_files(tmp_path, "quiz generation", boost_down=0.5, boost_up=0.0)
     paths = [r[0] for r in results]
 
     assert "quiz.py" in paths
-    # scoring.py should get an import boost from quiz.py's high score
     if "scoring.py" in paths:
         scoring_score = next(s for p, s in results if p == "scoring.py")
         assert scoring_score > 0
+
+
+# TEST: boost_up propagates relevance from a high-scoring dependency back to its consumers
+def test_search_files_boost_up(tmp_path):
+    (tmp_path / "main.py").write_text(textwrap.dedent('''
+        from engine import run
+
+        def entry_point():
+            """Application entry point."""
+            run()
+    '''))
+
+    (tmp_path / "engine.py").write_text(textwrap.dedent('''
+        def run():
+            """Run the engine."""
+            pass
+
+        def engine_helper():
+            """Internal engine helper."""
+            pass
+    '''))
+
+    # engine.py matches "engine" query directly; main.py imports it
+    # With boost_up, main.py should be elevated because engine.py is relevant
+    results = search_files(tmp_path, "engine", boost_down=0.0, boost_up=0.5)
+    paths = [r[0] for r in results]
+
+    assert "engine.py" in paths
+    # main.py imports engine.py (high-scoring) so should get a boost
+    assert "main.py" in paths
+    engine_score = next(s for p, s in results if p == "engine.py")
+    main_score = next(s for p, s in results if p == "main.py")
+    # engine.py scores higher directly, but main.py gets a non-zero boost
+    assert main_score > 0
+    assert engine_score > main_score
+
+
+# TEST: boost_up > boost_down means consumers of relevant deps score higher than deps of relevant consumers
+def test_search_files_boost_asymmetry(tmp_path):
+    """With default params, boost_up (0.4) > boost_down (0.2) so consumers of
+    a highly-relevant dep get bigger boosts than unrelated deps of a relevant file."""
+    (tmp_path / "core.py").write_text(textwrap.dedent('''
+        def core_algorithm():
+            """The core algorithm."""
+            pass
+    '''))
+    (tmp_path / "caller.py").write_text(textwrap.dedent('''
+        from core import core_algorithm
+        from unrelated import helper
+
+        def use_core():
+            """Calls core algorithm."""
+            core_algorithm()
+    '''))
+    (tmp_path / "unrelated.py").write_text(textwrap.dedent('''
+        def helper():
+            """A helper with no query relevance."""
+            pass
+    '''))
+
+    # core.py matches; caller.py imports core.py (boost_up from core)
+    # unrelated.py is imported BY caller.py (boost_down from caller)
+    results = search_files(tmp_path, "core algorithm")
+    score_map = {p: s for p, s in results}
+
+    assert "core.py" in score_map
+    # caller.py should appear — boost_up from core.py elevates it
+    if "caller.py" in score_map and "unrelated.py" in score_map:
+        # caller gets boost_up * core.score; unrelated gets boost_down * caller.score
+        # caller.score > unrelated.score because boost_up > boost_down applied differently
+        assert score_map["caller.py"] > score_map["unrelated.py"]
 
 
 # ---------------------------------------------------------------------------
